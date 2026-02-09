@@ -29,6 +29,17 @@ DEFAULT_MAX_RESULTS: int = 10
 # Debounce delay for file watcher (seconds)
 WATCHER_DEBOUNCE_SECONDS: float = 2.0
 
+# Default excluded directories
+DEFAULT_EXCLUDED_DIRS: list[str] = [
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".legal_workspace_index",
+]
+
+# Default excluded file patterns
+DEFAULT_EXCLUDED_PATTERNS: list[str] = [
+    ".*",  # hidden files
+]
+
 # Index persistence filename
 INDEX_FILENAME: str = ".legal_workspace_index.json"
 
@@ -44,13 +55,8 @@ class WorkspaceConfig:
     chunk_size: int = DEFAULT_CHUNK_SIZE
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
     max_results: int = DEFAULT_MAX_RESULTS
-    excluded_dirs: list[str] = field(default_factory=lambda: [
-        ".git", "__pycache__", "node_modules", ".venv", "venv",
-        ".legal_workspace_index"
-    ])
-    excluded_patterns: list[str] = field(default_factory=lambda: [
-        ".*",  # hidden files
-    ])
+    excluded_dirs: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_DIRS))
+    excluded_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
     file_extensions: set[str] = field(default_factory=lambda: SUPPORTED_EXTENSIONS.copy())
 
     @property
@@ -135,6 +141,6 @@ def load_config(workspace_path: Optional[str] = None) -> WorkspaceConfig:
         chunk_size=extra.get("chunk_size", DEFAULT_CHUNK_SIZE),
         chunk_overlap=extra.get("chunk_overlap", DEFAULT_CHUNK_OVERLAP),
         max_results=extra.get("max_results", DEFAULT_MAX_RESULTS),
-        excluded_dirs=extra.get("excluded_dirs", WorkspaceConfig.excluded_dirs),
-        excluded_patterns=extra.get("excluded_patterns", WorkspaceConfig.excluded_patterns),
+        excluded_dirs=extra.get("excluded_dirs", DEFAULT_EXCLUDED_DIRS),
+        excluded_patterns=extra.get("excluded_patterns", DEFAULT_EXCLUDED_PATTERNS),
     )

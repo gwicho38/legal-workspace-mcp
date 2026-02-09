@@ -14,6 +14,7 @@ Tools:
 import json
 import logging
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -40,6 +41,15 @@ _watcher: Optional[WorkspaceWatcher] = None
 _config: Optional[WorkspaceConfig] = None
 
 
+def _build_index_background():
+    """Build the full index in a background thread."""
+    try:
+        summary = _index.build_full_index()
+        logger.info("Background index build complete: %s", summary)
+    except Exception as e:
+        logger.error("Background index build failed: %s", e)
+
+
 @asynccontextmanager
 async def server_lifespan(mcp_server):
     """Initialize index and file watcher on server startup."""
@@ -53,17 +63,21 @@ async def server_lifespan(mcp_server):
 
     logger.info("Workspace: %s", _config.resolved_path)
 
-    # Create and populate index
+    # Create index
     _index = DocumentIndex(_config)
 
-    # Try loading persisted index first for fast startup
-    if _index.load_persisted_index():
-        logger.info("Loaded persisted index, will verify in background")
-        # Still do a full rebuild to catch any changes since last run
-        _index.build_full_index()
+    # Try loading persisted index for fast startup
+    has_persisted = _index.load_persisted_index()
+
+    # Build/rebuild the full index in a background thread so the server
+    # can start accepting MCP connections immediately
+    build_thread = threading.Thread(target=_build_index_background, daemon=True)
+    build_thread.start()
+
+    if has_persisted:
+        logger.info("Serving from persisted index while rebuilding in background")
     else:
-        logger.info("No persisted index found, building from scratch")
-        _index.build_full_index()
+        logger.info("Index building in background, tools available once ready")
 
     # Start file watcher for live updates
     _watcher = WorkspaceWatcher(_index, _config)

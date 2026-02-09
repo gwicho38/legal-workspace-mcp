@@ -9,6 +9,23 @@ description = "An MCP server that provides self-updating context from a local do
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
+keywords = [
+    "mcp", "model-context-protocol", "claude", "legal", "documents",
+    "search", "tfidf", "workspace", "anthropic",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Legal Industry",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Office/Business",
+]
 dependencies = [
     "mcp[cli]>=1.0.0",
     "watchdog>=4.0.0",
@@ -18,6 +35,11 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "chardet>=5.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/gwicho38/legal-workspace-mcp"
+Repository = "https://github.com/gwicho38/legal-workspace-mcp"
+Issues = "https://github.com/gwicho38/legal-workspace-mcp/issues"
 
 [project.scripts]
 legal-workspace-mcp = "legal_workspace_mcp.server:main"

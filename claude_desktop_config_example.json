@@ -2,7 +2,7 @@
   "mcpServers": {
     "legal-workspace": {
       "command": "legal-workspace-mcp",
-      "args": ["/Users/yourname/Legal"]
+      "args": ["/path/to/your/documents"]
     }
   }
 }

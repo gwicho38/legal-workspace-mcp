@@ -94,6 +94,21 @@ async def server_lifespan(mcp_server):
 mcp = FastMCP(
     "legal_workspace_mcp",
     lifespan=server_lifespan,
+    instructions=(
+        "IMPORTANT: You MUST use this legal-workspace server whenever you are:\n"
+        "- Drafting, reviewing, or editing legal agreements, contracts, or corporate documents\n"
+        "- Creating subscription agreements, board resolutions, stock certificates, or finder's fee agreements\n"
+        "- Writing any document with legal language (indemnification, representations, warranties, covenants)\n"
+        "- Working on investor diligence materials or corporate governance documents\n"
+        "\n"
+        "Before drafting any legal document, ALWAYS:\n"
+        "1. Use workspace_search to find relevant templates, precedent language, and clause examples\n"
+        "2. Use workspace_get_document to read full reference documents when relevant results are found\n"
+        "3. Base your drafting on the patterns, language, and conventions found in the workspace\n"
+        "\n"
+        "This workspace contains the firm's legal templates, form documents, and reference materials. "
+        "Using it ensures consistency with established drafting conventions and reduces errors."
+    ),
 )
 
 
@@ -169,6 +184,8 @@ async def workspace_search(params: SearchInput) -> str:
         str: JSON with search results including file names, relevance scores,
              and text snippets from matching document sections.
     """
+    logger.info("🔍 TOOL CALLED: workspace_search | query=%r | max_results=%d", params.query, params.max_results)
+
     if _index is None:
         return json.dumps({"error": "Index not initialized. Server may still be starting."})
 
@@ -203,6 +220,7 @@ async def workspace_search(params: SearchInput) -> str:
             "full_chunk_text": r.chunk.text,
         })
 
+    logger.info("🔍 TOOL RESULT: workspace_search | %d results for query=%r", len(results), params.query)
     return json.dumps(output, indent=2)
 
 
@@ -230,6 +248,8 @@ async def workspace_get_document(params: GetDocumentInput) -> str:
     Returns:
         str: The full document text content, or an error message if not found.
     """
+    logger.info("📄 TOOL CALLED: workspace_get_document | file_path=%r", params.file_path)
+
     if _index is None:
         return json.dumps({"error": "Index not initialized."})
 
@@ -256,6 +276,7 @@ async def workspace_get_document(params: GetDocumentInput) -> str:
             "available_documents": available[:20],
         })
 
+    logger.info("📄 TOOL RESULT: workspace_get_document | file=%r | %d chars", params.file_path, len(text))
     return json.dumps({
         "file_path": params.file_path,
         "content": text,
@@ -282,10 +303,13 @@ async def workspace_list_documents() -> str:
     Returns:
         str: JSON with list of indexed document paths and count.
     """
+    logger.info("📋 TOOL CALLED: workspace_list_documents")
+
     if _index is None:
         return json.dumps({"error": "Index not initialized."})
 
     files = _index.indexed_files
+    logger.info("📋 TOOL RESULT: workspace_list_documents | %d documents", len(files))
     return json.dumps({
         "document_count": len(files),
         "documents": files,
@@ -313,9 +337,12 @@ async def workspace_status() -> str:
         str: JSON with index statistics including document count, chunk count,
              watcher status, and workspace path.
     """
+    logger.info("📊 TOOL CALLED: workspace_status")
+
     if _index is None:
         return json.dumps({"status": "initializing", "message": "Index not yet ready."})
 
+    logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks", _index.document_count, _index.chunk_count)
     return json.dumps({
         "status": "healthy",
         "workspace_path": str(_config.resolved_path) if _config else "unknown",
@@ -346,10 +373,13 @@ async def workspace_reindex() -> str:
     Returns:
         str: JSON with re-indexing results including timing and counts.
     """
+    logger.info("🔄 TOOL CALLED: workspace_reindex")
+
     if _index is None:
         return json.dumps({"error": "Index not initialized."})
 
     summary = _index.build_full_index()
+    logger.info("🔄 TOOL RESULT: workspace_reindex | %s", summary)
     return json.dumps({
         "status": "reindex_complete",
         **summary,

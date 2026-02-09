@@ -115,8 +115,9 @@ class _DebouncedHandler(FileSystemEventHandler):
 
     def _is_relevant(self, file_path: Path) -> bool:
         """Check if a file change is relevant for indexing."""
-        # Skip hidden files
-        if file_path.name.startswith("."):
+        name = file_path.name
+        # Skip hidden files and Office temp/lock files (~$document.docx)
+        if name.startswith(".") or name.startswith("~$"):
             return False
         # Skip unsupported extensions
         if file_path.suffix.lower() not in self._config.file_extensions:

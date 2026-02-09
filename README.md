@@ -181,7 +181,6 @@ Once configured, Claude gains access to these tools:
 | Word | `.docx` |
 | HTML | `.html`, `.htm` |
 | Rich Text | `.rtf` |
-| Data | `.json`, `.csv` |
 
 ## Example Usage
 

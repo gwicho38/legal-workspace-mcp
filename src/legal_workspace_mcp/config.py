@@ -15,8 +15,6 @@ SUPPORTED_EXTENSIONS: set[str] = {
     ".docx",
     ".html", ".htm",
     ".rtf",
-    ".json",
-    ".csv",
 }
 
 # Default chunk size for splitting documents (in characters)
@@ -32,7 +30,7 @@ WATCHER_DEBOUNCE_SECONDS: float = 2.0
 # Default excluded directories
 DEFAULT_EXCLUDED_DIRS: list[str] = [
     ".git", "__pycache__", "node_modules", ".venv", "venv",
-    ".legal_workspace_index",
+    ".legal_workspace_index", "backend_OLD",
 ]
 
 # Default excluded file patterns

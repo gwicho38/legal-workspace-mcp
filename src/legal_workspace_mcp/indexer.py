@@ -345,7 +345,8 @@ class DocumentIndex:
 
     def _is_supported_file(self, file_path: Path) -> bool:
         """Check if a file is supported for indexing."""
-        if file_path.name.startswith("."):
+        name = file_path.name
+        if name.startswith(".") or name.startswith("~$"):
             return False
         return file_path.suffix.lower() in self.config.file_extensions
 
@@ -497,7 +498,13 @@ class DocumentIndex:
         return " ".join(snippet_parts) if snippet_parts else text[:max_length] + "..."
 
     def _save_index(self) -> None:
-        """Persist the index to disk."""
+        """Persist the index to disk using atomic write.
+
+        Writes to a temporary file first, then atomically replaces the
+        target. This prevents corruption if the process is killed mid-write.
+        """
+        index_path = self.config.index_path
+        tmp_path = index_path.with_suffix(".json.tmp")
         try:
             data = {
                 "version": 1,
@@ -505,9 +512,16 @@ class DocumentIndex:
                 "chunks": [c.to_dict() for c in self._chunks],
                 "file_hashes": self._file_hashes,
             }
-            index_path = self.config.index_path
-            with open(index_path, "w") as f:
+            with open(tmp_path, "w") as f:
                 json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, index_path)
             self._dirty = False
         except Exception as e:
             logger.error("Failed to save index: %s", e)
+            # Clean up partial temp file
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass

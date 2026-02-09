@@ -24,6 +24,7 @@ Thumbs.db
 
 # Index files (generated)
 .legal_workspace_index.json
+.legal_workspace_index.json.tmp
 
 # Config (may contain paths)
 .legal-workspace-mcp.json

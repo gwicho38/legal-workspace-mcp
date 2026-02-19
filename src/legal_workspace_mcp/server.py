@@ -14,8 +14,6 @@ Tools:
 import json
 import logging
 import sys
-import threading
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -41,15 +39,6 @@ _watcher: Optional[WorkspaceWatcher] = None
 _config: Optional[WorkspaceConfig] = None
 
 
-def _build_index_background():
-    """Build the full index in a background thread."""
-    try:
-        summary = _index.build_full_index()
-        logger.info("Background index build complete: %s", summary)
-    except Exception as e:
-        logger.error("Background index build failed: %s", e)
-
-
 @asynccontextmanager
 async def server_lifespan(mcp_server):
     """Initialize index and file watcher on server startup."""
@@ -63,21 +52,13 @@ async def server_lifespan(mcp_server):
 
     logger.info("Workspace: %s", _config.resolved_path)
 
-    # Create index
+    # Create index (opens or creates SQLite database)
     _index = DocumentIndex(_config)
 
-    # Try loading persisted index for fast startup
-    has_persisted = _index.load_persisted_index()
-
-    # Build/rebuild the full index in a background thread so the server
-    # can start accepting MCP connections immediately
-    build_thread = threading.Thread(target=_build_index_background, daemon=True)
-    build_thread.start()
-
-    if has_persisted:
-        logger.info("Serving from persisted index while rebuilding in background")
-    else:
-        logger.info("Index building in background, tools available once ready")
+    # Build index synchronously — SQLite is fast enough and the DB
+    # persists across restarts, so only changed files are re-indexed
+    summary = _index.build_full_index()
+    logger.info("Index ready: %s", summary)
 
     # Start file watcher for live updates
     _watcher = WorkspaceWatcher(_index, _config)
@@ -88,6 +69,8 @@ async def server_lifespan(mcp_server):
     # Cleanup
     if _watcher:
         _watcher.stop()
+    if _index:
+        _index.close()
 
 
 # Initialize FastMCP server
@@ -126,7 +109,7 @@ class SearchInput(BaseModel):
             "Search query describing what you're looking for. "
             "Use natural language - e.g., 'indemnification clause examples', "
             "'force majeure provisions', 'how to draft non-compete agreements'. "
-            "The search uses TF-IDF relevance scoring across all indexed documents."
+            "The search uses BM25 relevance scoring across all indexed documents."
         ),
         min_length=1,
         max_length=500,
@@ -345,9 +328,11 @@ async def workspace_status() -> str:
     logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks", _index.document_count, _index.chunk_count)
     return json.dumps({
         "status": "healthy",
+        "index_type": "SQLite FTS5 (BM25)",
         "workspace_path": str(_config.resolved_path) if _config else "unknown",
         "document_count": _index.document_count,
         "chunk_count": _index.chunk_count,
+        "database_size_mb": round(_index.database_size_mb, 2),
         "watcher_active": _watcher.is_running if _watcher else False,
         "indexed_files": _index.indexed_files,
     }, indent=2)

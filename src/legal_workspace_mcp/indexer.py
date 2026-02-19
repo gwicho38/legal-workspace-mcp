@@ -1,27 +1,26 @@
-"""Document indexing and search engine using TF-IDF.
+"""Document indexing and search engine using SQLite FTS5.
 
-Handles chunking documents, building a searchable index, and persisting
-the index to disk so it survives server restarts.
+Handles chunking documents, building a searchable index with BM25 ranking,
+and persisting the index to a SQLite database that survives server restarts.
 """
 
 import hashlib
-import json
 import logging
 import os
 import re
+import sqlite3
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-
-from .config import WorkspaceConfig
+from .config import WorkspaceConfig, LEGACY_INDEX_FILENAME
 from .extractors import extract_text
 
 logger = logging.getLogger(__name__)
+
+# SQLite schema version for future migrations
+SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -38,13 +37,6 @@ class DocumentChunk:
     file_modified: float
     file_size: int
 
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "DocumentChunk":
-        return cls(**data)
-
 
 @dataclass
 class SearchResult:
@@ -56,46 +48,123 @@ class SearchResult:
 
 
 class DocumentIndex:
-    """TF-IDF based document index with file-watching support.
+    """SQLite FTS5 document index with BM25 ranking.
 
     The index automatically handles:
     - Chunking documents into searchable pieces
-    - Building a TF-IDF matrix for fast search
-    - Persisting the index to disk
+    - BM25-ranked full-text search via SQLite FTS5
+    - Persisting the index to a SQLite database
     - Incremental updates when files change
+    - File size and chunk limits to bound memory usage
     """
 
     def __init__(self, config: WorkspaceConfig):
         self.config = config
-        self._chunks: list[DocumentChunk] = []
-        self._vectorizer: Optional[TfidfVectorizer] = None
-        self._tfidf_matrix = None
-        self._file_hashes: dict[str, str] = {}  # path -> hash
-        self._last_rebuild: float = 0
-        self._dirty: bool = False
+        self._conn: Optional[sqlite3.Connection] = None
+        self._init_db()
+
+    def _init_db(self) -> None:
+        """Initialize the SQLite database and create tables."""
+        db_path = self.config.index_path
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+
+        # Performance pragmas
+        self._conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA cache_size=-2000;
+            PRAGMA temp_store=MEMORY;
+        """)
+
+        # Create tables
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS file_meta(
+                file_path TEXT PRIMARY KEY,
+                file_name TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                file_modified REAL NOT NULL,
+                file_size INTEGER NOT NULL,
+                total_chunks INTEGER NOT NULL,
+                indexed_at REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS schema_info(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+        """)
+
+        # Create FTS5 table if it doesn't exist
+        self._conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+                file_path UNINDEXED,
+                file_name,
+                chunk_index UNINDEXED,
+                total_chunks UNINDEXED,
+                text,
+                tokenize='porter unicode61'
+            );
+        """)
+
+        # Store schema version
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_info(key, value) VALUES('version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self._conn:
+            try:
+                self._conn.execute("PRAGMA optimize")
+                self._conn.close()
+            except Exception as e:
+                logger.error("Error closing database: %s", e)
+            finally:
+                self._conn = None
 
     @property
     def document_count(self) -> int:
         """Number of unique documents in the index."""
-        return len(set(c.file_path for c in self._chunks))
+        if not self._conn:
+            return 0
+        row = self._conn.execute("SELECT COUNT(*) FROM file_meta").fetchone()
+        return row[0] if row else 0
 
     @property
     def chunk_count(self) -> int:
         """Total number of chunks in the index."""
-        return len(self._chunks)
+        if not self._conn:
+            return 0
+        row = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+        return row[0] if row else 0
 
     @property
     def indexed_files(self) -> list[str]:
         """List of all indexed file paths (relative to workspace)."""
+        if not self._conn:
+            return []
         workspace = self.config.resolved_path
-        unique = sorted(set(c.file_path for c in self._chunks))
+        rows = self._conn.execute(
+            "SELECT file_path FROM file_meta ORDER BY file_path"
+        ).fetchall()
         result = []
-        for p in unique:
+        for row in rows:
             try:
-                result.append(str(Path(p).relative_to(workspace)))
+                result.append(str(Path(row[0]).relative_to(workspace)))
             except ValueError:
-                result.append(p)
+                result.append(row[0])
         return result
+
+    @property
+    def database_size_mb(self) -> float:
+        """Size of the SQLite database file in MB."""
+        db_path = self.config.index_path
+        if db_path.exists():
+            return db_path.stat().st_size / (1024 * 1024)
+        return 0.0
 
     def build_full_index(self) -> dict:
         """Scan the workspace and build/rebuild the full index.
@@ -110,28 +179,44 @@ class DocumentIndex:
             logger.error("Workspace path does not exist: %s", workspace)
             return {"error": f"Workspace path not found: {workspace}"}
 
+        # Check for legacy JSON index and migrate
+        self._migrate_legacy_index()
+
         # Discover all supported files
         files = self._discover_files(workspace)
         logger.info("Discovered %d files in workspace", len(files))
 
-        # Extract and chunk all documents
-        new_chunks: list[DocumentChunk] = []
-        new_hashes: dict[str, str] = {}
+        # Get currently indexed file hashes for change detection
+        existing_hashes: dict[str, str] = {}
+        if self._conn:
+            rows = self._conn.execute(
+                "SELECT file_path, file_hash FROM file_meta"
+            ).fetchall()
+            existing_hashes = {row[0]: row[1] for row in rows}
+
+        # Track which files are still present
+        current_files: set[str] = set()
         errors: list[str] = []
 
         for file_path in files:
+            str_path = str(file_path)
+            current_files.add(str_path)
+
             try:
+                stat = file_path.stat()
+
+                # Skip files exceeding size limit
+                if stat.st_size > self.config.max_file_size:
+                    logger.debug("Skipping %s (%.1fMB > %.1fMB limit)",
+                                 file_path.name,
+                                 stat.st_size / 1_000_000,
+                                 self.config.max_file_size / 1_000_000)
+                    continue
+
                 file_hash = self._compute_file_hash(file_path)
-                new_hashes[str(file_path)] = file_hash
 
                 # Skip if unchanged
-                if (
-                    str(file_path) in self._file_hashes
-                    and self._file_hashes[str(file_path)] == file_hash
-                ):
-                    # Reuse existing chunks
-                    existing = [c for c in self._chunks if c.file_path == str(file_path)]
-                    new_chunks.extend(existing)
+                if existing_hashes.get(str_path) == file_hash:
                     continue
 
                 text = extract_text(file_path)
@@ -140,18 +225,18 @@ class DocumentIndex:
                     continue
 
                 chunks = self._chunk_text(text, file_path)
-                new_chunks.extend(chunks)
+                self._store_file(file_path, chunks, file_hash, stat)
                 logger.info("Indexed %s (%d chunks)", file_path.name, len(chunks))
 
             except Exception as e:
                 logger.error("Error indexing %s: %s", file_path, e)
                 errors.append(f"{file_path.name}: {e}")
 
-        self._chunks = new_chunks
-        self._file_hashes = new_hashes
-        self._rebuild_tfidf()
-        self._last_rebuild = time.time()
-        self._dirty = True
+        # Remove files that no longer exist in workspace
+        stale_files = set(existing_hashes.keys()) - current_files
+        for stale_path in stale_files:
+            self._remove_file_from_db(stale_path)
+            logger.info("Removed stale file from index: %s", Path(stale_path).name)
 
         elapsed = time.time() - start
         summary = {
@@ -160,9 +245,6 @@ class DocumentIndex:
             "elapsed_seconds": round(elapsed, 2),
             "errors": errors,
         }
-
-        # Persist to disk
-        self._save_index()
 
         logger.info(
             "Index built: %d documents, %d chunks in %.2fs",
@@ -180,29 +262,37 @@ class DocumentIndex:
             return
 
         str_path = str(file_path)
+
+        try:
+            stat = file_path.stat()
+        except FileNotFoundError:
+            self._remove_file_from_db(str_path)
+            return
+
+        # Skip files exceeding size limit
+        if stat.st_size > self.config.max_file_size:
+            logger.debug("Skipping %s (exceeds max_file_size)", file_path.name)
+            return
+
         file_hash = self._compute_file_hash(file_path)
 
         # Skip if unchanged
-        if str_path in self._file_hashes and self._file_hashes[str_path] == file_hash:
-            return
-
-        # Remove old chunks for this file
-        self._chunks = [c for c in self._chunks if c.file_path != str_path]
+        if self._conn:
+            row = self._conn.execute(
+                "SELECT file_hash FROM file_meta WHERE file_path = ?",
+                (str_path,),
+            ).fetchone()
+            if row and row[0] == file_hash:
+                return
 
         # Extract and chunk
         text = extract_text(file_path)
         if text and text.strip():
             chunks = self._chunk_text(text, file_path)
-            self._chunks.extend(chunks)
-            self._file_hashes[str_path] = file_hash
+            self._store_file(file_path, chunks, file_hash, stat)
             logger.info("Updated index for %s (%d chunks)", file_path.name, len(chunks))
         else:
-            # Remove from hashes if no text
-            self._file_hashes.pop(str_path, None)
-
-        self._rebuild_tfidf()
-        self._dirty = True
-        self._save_index()
+            self._remove_file_from_db(str_path)
 
     def remove_file(self, file_path: Path) -> None:
         """Remove a file from the index.
@@ -211,15 +301,14 @@ class DocumentIndex:
             file_path: Absolute path to the removed file.
         """
         str_path = str(file_path)
-        before = len(self._chunks)
-        self._chunks = [c for c in self._chunks if c.file_path != str_path]
-        self._file_hashes.pop(str_path, None)
-
-        if len(self._chunks) != before:
-            logger.info("Removed %s from index", file_path.name)
-            self._rebuild_tfidf()
-            self._dirty = True
-            self._save_index()
+        if self._conn:
+            row = self._conn.execute(
+                "SELECT file_path FROM file_meta WHERE file_path = ?",
+                (str_path,),
+            ).fetchone()
+            if row:
+                self._remove_file_from_db(str_path)
+                logger.info("Removed %s from index", file_path.name)
 
     def search(self, query: str, max_results: Optional[int] = None) -> list[SearchResult]:
         """Search the index for relevant document chunks.
@@ -229,41 +318,75 @@ class DocumentIndex:
             max_results: Maximum number of results to return.
 
         Returns:
-            List of SearchResult objects sorted by relevance.
+            List of SearchResult objects sorted by relevance (BM25).
         """
-        if not self._chunks or self._tfidf_matrix is None or self._vectorizer is None:
+        if not self._conn:
             return []
 
         limit = max_results or self.config.max_results
 
-        # Transform query using the fitted vectorizer
-        query_vec = self._vectorizer.transform([query])
-        similarities = cosine_similarity(query_vec, self._tfidf_matrix).flatten()
+        # Prepare FTS5 query: escape special characters and add * suffix for prefix matching
+        fts_query = self._prepare_fts_query(query)
+        if not fts_query:
+            return []
 
-        # Get top results above a minimum threshold
-        min_score = 0.01
-        top_indices = np.argsort(similarities)[::-1]
+        try:
+            # Query with diversity limit: fetch more than needed, then apply per-file cap
+            fetch_limit = limit * 5  # Fetch extra for diversity filtering
+            rows = self._conn.execute(
+                """
+                SELECT file_path, file_name, chunk_index, total_chunks, text,
+                       rank
+                FROM chunks
+                WHERE chunks MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, fetch_limit),
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("FTS5 query failed for %r: %s", query, e)
+            return []
 
         results: list[SearchResult] = []
-        seen_files: dict[str, int] = {}  # Track results per file for diversity
+        seen_files: dict[str, int] = {}
 
-        for idx in top_indices:
+        for row in rows:
             if len(results) >= limit:
                 break
 
-            score = float(similarities[idx])
-            if score < min_score:
-                break
+            file_path = row[0]
 
-            chunk = self._chunks[idx]
-
-            # Light diversity: max 3 chunks from the same file in results
-            file_count = seen_files.get(chunk.file_path, 0)
+            # Diversity: max 3 chunks from the same file
+            file_count = seen_files.get(file_path, 0)
             if file_count >= 3:
                 continue
-            seen_files[chunk.file_path] = file_count + 1
+            seen_files[file_path] = file_count + 1
 
-            snippet = self._create_snippet(chunk.text, query)
+            # BM25 rank is negative (lower = better), convert to positive score
+            score = -float(row[5])
+
+            chunk_text = row[4]
+            snippet = self._create_snippet(chunk_text, query)
+
+            # Look up file metadata for the chunk
+            meta_row = self._conn.execute(
+                "SELECT file_hash, file_modified, file_size FROM file_meta WHERE file_path = ?",
+                (file_path,),
+            ).fetchone()
+
+            chunk = DocumentChunk(
+                chunk_id=f"{file_path}:{row[2]}",
+                file_path=file_path,
+                file_name=row[1],
+                chunk_index=int(row[2]),
+                total_chunks=int(row[3]),
+                text=chunk_text,
+                file_hash=meta_row[0] if meta_row else "",
+                file_modified=float(meta_row[1]) if meta_row else 0.0,
+                file_size=int(meta_row[2]) if meta_row else 0,
+            )
+
             results.append(SearchResult(chunk=chunk, score=score, snippet=snippet))
 
         return results
@@ -277,52 +400,96 @@ class DocumentIndex:
         Returns:
             Full document text, or None if not found.
         """
-        # Try to match as absolute path first, then relative
+        if not self._conn:
+            return None
+
         workspace = self.config.resolved_path
         candidates = [file_path, str(workspace / file_path)]
 
-        matching_chunks = []
         for candidate in candidates:
-            matching_chunks = sorted(
-                [c for c in self._chunks if c.file_path == candidate],
-                key=lambda c: c.chunk_index,
-            )
-            if matching_chunks:
-                break
+            rows = self._conn.execute(
+                "SELECT text FROM chunks WHERE file_path = ? ORDER BY CAST(chunk_index AS INTEGER)",
+                (candidate,),
+            ).fetchall()
+            if rows:
+                return "\n\n".join(row[0] for row in rows)
 
-        if not matching_chunks:
-            return None
-
-        # Reassemble from chunks (handle overlap by using the first occurrence)
-        return "\n\n".join(c.text for c in matching_chunks)
-
-    def load_persisted_index(self) -> bool:
-        """Load a previously persisted index from disk.
-
-        Returns:
-            True if an index was successfully loaded.
-        """
-        index_path = self.config.index_path
-        if not index_path.exists():
-            return False
-
-        try:
-            with open(index_path, "r") as f:
-                data = json.load(f)
-
-            self._chunks = [DocumentChunk.from_dict(c) for c in data.get("chunks", [])]
-            self._file_hashes = data.get("file_hashes", {})
-
-            if self._chunks:
-                self._rebuild_tfidf()
-                logger.info("Loaded persisted index: %d chunks", len(self._chunks))
-                return True
-        except Exception as e:
-            logger.error("Failed to load persisted index: %s", e)
-
-        return False
+        return None
 
     # --- Private methods ---
+
+    def _store_file(self, file_path: Path, chunks: list[DocumentChunk],
+                    file_hash: str, stat: os.stat_result) -> None:
+        """Store a file's chunks and metadata in the database atomically."""
+        if not self._conn:
+            return
+
+        str_path = str(file_path)
+
+        # Remove old data for this file
+        self._remove_file_from_db(str_path)
+
+        # Insert chunks
+        for chunk in chunks:
+            self._conn.execute(
+                "INSERT INTO chunks(file_path, file_name, chunk_index, total_chunks, text) VALUES(?, ?, ?, ?, ?)",
+                (str_path, file_path.name, chunk.chunk_index, chunk.total_chunks, chunk.text),
+            )
+
+        # Insert file metadata
+        self._conn.execute(
+            """INSERT OR REPLACE INTO file_meta(file_path, file_name, file_hash, file_modified, file_size, total_chunks, indexed_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?)""",
+            (str_path, file_path.name, file_hash, stat.st_mtime, stat.st_size, len(chunks), time.time()),
+        )
+        self._conn.commit()
+
+    def _remove_file_from_db(self, file_path: str) -> None:
+        """Remove all data for a file from the database."""
+        if not self._conn:
+            return
+        # FTS5 requires DELETE with rowid; use content match instead
+        self._conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+        self._conn.execute("DELETE FROM file_meta WHERE file_path = ?", (file_path,))
+        self._conn.commit()
+
+    def _migrate_legacy_index(self) -> None:
+        """Handle migration from old JSON index format."""
+        workspace = self.config.resolved_path
+        legacy_path = workspace / LEGACY_INDEX_FILENAME
+
+        if not legacy_path.exists():
+            return
+
+        # Don't try to parse potentially-corrupted JSON — just build fresh
+        logger.info("Found legacy JSON index at %s — will build fresh SQLite index", legacy_path)
+        try:
+            backup_path = legacy_path.with_suffix(".json.old")
+            legacy_path.rename(backup_path)
+            logger.info("Renamed legacy index to %s", backup_path.name)
+        except Exception as e:
+            logger.warning("Could not rename legacy index: %s", e)
+
+    def _prepare_fts_query(self, query: str) -> str:
+        """Prepare a user query for FTS5 MATCH syntax.
+
+        Handles special characters and converts to a safe FTS5 query.
+        """
+        # Remove FTS5 special characters that could cause syntax errors
+        cleaned = re.sub(r'[^\w\s]', ' ', query)
+        terms = cleaned.split()
+        if not terms:
+            return ""
+
+        # Join terms with implicit AND (FTS5 default)
+        # Use quotes around individual terms that might be FTS5 keywords
+        safe_terms = []
+        for term in terms:
+            term = term.strip()
+            if term:
+                safe_terms.append(f'"{term}"')
+
+        return " ".join(safe_terms)
 
     def _discover_files(self, workspace: Path) -> list[Path]:
         """Recursively discover all supported files in the workspace."""
@@ -436,6 +603,14 @@ class DocumentIndex:
         if not chunks and text.strip():
             chunks = [text.strip()]
 
+        # Apply per-file chunk limit
+        if len(chunks) > self.config.max_chunks_per_file:
+            logger.warning(
+                "Truncating %s from %d to %d chunks",
+                file_path.name, len(chunks), self.config.max_chunks_per_file,
+            )
+            chunks = chunks[: self.config.max_chunks_per_file]
+
         stat = file_path.stat()
         file_hash = self._compute_file_hash(file_path)
 
@@ -453,24 +628,6 @@ class DocumentIndex:
             )
             for i, chunk_text in enumerate(chunks)
         ]
-
-    def _rebuild_tfidf(self) -> None:
-        """Rebuild the TF-IDF matrix from current chunks."""
-        if not self._chunks:
-            self._vectorizer = None
-            self._tfidf_matrix = None
-            return
-
-        texts = [c.text for c in self._chunks]
-        self._vectorizer = TfidfVectorizer(
-            max_features=50000,
-            stop_words="english",
-            ngram_range=(1, 2),
-            min_df=1,
-            max_df=0.95,
-            sublinear_tf=True,
-        )
-        self._tfidf_matrix = self._vectorizer.fit_transform(texts)
 
     def _create_snippet(self, text: str, query: str, max_length: int = 300) -> str:
         """Create a relevance-highlighted snippet from chunk text."""
@@ -496,32 +653,3 @@ class DocumentIndex:
             length += len(sent)
 
         return " ".join(snippet_parts) if snippet_parts else text[:max_length] + "..."
-
-    def _save_index(self) -> None:
-        """Persist the index to disk using atomic write.
-
-        Writes to a temporary file first, then atomically replaces the
-        target. This prevents corruption if the process is killed mid-write.
-        """
-        index_path = self.config.index_path
-        tmp_path = index_path.with_suffix(".json.tmp")
-        try:
-            data = {
-                "version": 1,
-                "built_at": time.time(),
-                "chunks": [c.to_dict() for c in self._chunks],
-                "file_hashes": self._file_hashes,
-            }
-            with open(tmp_path, "w") as f:
-                json.dump(data, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, index_path)
-            self._dirty = False
-        except Exception as e:
-            logger.error("Failed to save index: %s", e)
-            # Clean up partial temp file
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass

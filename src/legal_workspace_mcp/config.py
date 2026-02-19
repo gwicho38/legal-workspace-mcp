@@ -39,7 +39,14 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
 ]
 
 # Index persistence filename
-INDEX_FILENAME: str = ".legal_workspace_index.json"
+INDEX_FILENAME: str = ".legal_workspace_index.db"
+
+# Legacy index filename (for migration)
+LEGACY_INDEX_FILENAME: str = ".legal_workspace_index.json"
+
+# File size and chunk limits
+DEFAULT_MAX_FILE_SIZE: int = 5_000_000  # 5MB
+DEFAULT_MAX_CHUNKS_PER_FILE: int = 200
 
 # Config file name
 CONFIG_FILENAME: str = ".legal-workspace-mcp.json"
@@ -56,6 +63,8 @@ class WorkspaceConfig:
     excluded_dirs: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_DIRS))
     excluded_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDED_PATTERNS))
     file_extensions: set[str] = field(default_factory=lambda: SUPPORTED_EXTENSIONS.copy())
+    max_file_size: int = DEFAULT_MAX_FILE_SIZE
+    max_chunks_per_file: int = DEFAULT_MAX_CHUNKS_PER_FILE
 
     @property
     def resolved_path(self) -> Path:
@@ -77,6 +86,8 @@ class WorkspaceConfig:
             "excluded_dirs": self.excluded_dirs,
             "excluded_patterns": self.excluded_patterns,
             "file_extensions": sorted(self.file_extensions),
+            "max_file_size": self.max_file_size,
+            "max_chunks_per_file": self.max_chunks_per_file,
         }
 
 
@@ -141,4 +152,6 @@ def load_config(workspace_path: Optional[str] = None) -> WorkspaceConfig:
         max_results=extra.get("max_results", DEFAULT_MAX_RESULTS),
         excluded_dirs=extra.get("excluded_dirs", DEFAULT_EXCLUDED_DIRS),
         excluded_patterns=extra.get("excluded_patterns", DEFAULT_EXCLUDED_PATTERNS),
+        max_file_size=extra.get("max_file_size", DEFAULT_MAX_FILE_SIZE),
+        max_chunks_per_file=extra.get("max_chunks_per_file", DEFAULT_MAX_CHUNKS_PER_FILE),
     )

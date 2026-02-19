@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "legal-workspace-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "An MCP server that provides self-updating context from a local document workspace to Claude, optimized for legal drafting workflows."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 keywords = [
     "mcp", "model-context-protocol", "claude", "legal", "documents",
-    "search", "tfidf", "workspace", "anthropic",
+    "search", "fts5", "bm25", "workspace", "anthropic",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -29,7 +29,6 @@ classifiers = [
 dependencies = [
     "mcp[cli]>=1.0.0",
     "watchdog>=4.0.0",
-    "scikit-learn>=1.4.0",
     "pymupdf>=1.24.0",
     "python-docx>=1.1.0",
     "beautifulsoup4>=4.12.0",

@@ -25,6 +25,13 @@ Thumbs.db
 # Index files (generated)
 .legal_workspace_index.json
 .legal_workspace_index.json.tmp
+.legal_workspace_index.json.old
+.legal_workspace_index.db
+.legal_workspace_index.db-wal
+.legal_workspace_index.db-shm
 
 # Config (may contain paths)
 .legal-workspace-mcp.json
+
+# Claude Code local settings
+.claude/settings.local.json

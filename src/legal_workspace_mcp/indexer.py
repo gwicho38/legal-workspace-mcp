@@ -492,11 +492,37 @@ class DocumentIndex:
         return " ".join(safe_terms)
 
     def _discover_files(self, workspace: Path) -> list[Path]:
-        """Recursively discover all supported files in the workspace."""
-        files: list[Path] = []
-        excluded_dirs = set(self.config.excluded_dirs)
+        """Recursively discover all supported files in the workspace.
 
-        for root, dirs, filenames in os.walk(workspace):
+        Symlinked directories are followed. A workspace root is commonly a hub
+        that holds little of its own and points at the real document trees
+        through links — one per firm, or per synced drive. ``os.walk`` does not
+        follow links by default, so such a workspace discovered nothing at all.
+
+        Following links brings two hazards, and both are contained by recording
+        the real path of every directory already walked: the same directory can
+        be reached by more than one route, and a link can point at its own
+        ancestor. The first would index a file twice, the second would not
+        terminate.
+        """
+        # keyed by real path, so a file reachable by several routes is kept once
+        files: dict[str, Path] = {}
+        excluded_dirs = set(self.config.excluded_dirs)
+        visited_dirs: set[str] = set()
+
+        for root, dirs, filenames in os.walk(workspace, followlinks=True):
+            try:
+                real_root = os.path.realpath(root)
+            except OSError:  # unreadable or vanished mid-walk
+                dirs[:] = []
+                continue
+
+            if real_root in visited_dirs:
+                # already walked by another route; do not descend again
+                dirs[:] = []
+                continue
+            visited_dirs.add(real_root)
+
             # Filter out excluded directories
             dirs[:] = [
                 d for d in dirs
@@ -505,10 +531,15 @@ class DocumentIndex:
 
             for filename in filenames:
                 file_path = Path(root) / filename
-                if self._is_supported_file(file_path):
-                    files.append(file_path)
+                if not self._is_supported_file(file_path):
+                    continue
+                try:
+                    real_file = os.path.realpath(file_path)
+                except OSError:
+                    continue
+                files.setdefault(real_file, file_path)
 
-        return sorted(files)
+        return sorted(files.values())
 
     def _is_supported_file(self, file_path: Path) -> bool:
         """Check if a file is supported for indexing."""

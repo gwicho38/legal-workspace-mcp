@@ -492,15 +492,31 @@ class DocumentIndex:
         return " ".join(safe_terms)
 
     def _discover_files(self, workspace: Path) -> list[Path]:
-        """Recursively discover all supported files in the workspace."""
+        """Recursively discover all supported files in the workspace.
+
+        Symlinked directories are followed. A workspace root is typically a hub of
+        symlinks into each firm's cloud-synced folder, and os.walk skips those by
+        default — which silently leaves a whole firm out of the index while the
+        status report still says "healthy". ``seen`` holds the real path of every
+        directory already walked so a symlink loop terminates instead of hanging.
+        """
         files: list[Path] = []
         excluded_dirs = set(self.config.excluded_dirs)
+        seen: set[str] = set()
 
-        for root, dirs, filenames in os.walk(workspace):
+        for root, dirs, filenames in os.walk(workspace, followlinks=True):
+            real_root = os.path.realpath(root)
+            if real_root in seen:
+                dirs[:] = []
+                continue
+            seen.add(real_root)
+
             # Filter out excluded directories
             dirs[:] = [
                 d for d in dirs
-                if d not in excluded_dirs and not d.startswith(".")
+                if d not in excluded_dirs
+                and not d.startswith(".")
+                and os.path.realpath(os.path.join(root, d)) not in seen
             ]
 
             for filename in filenames:

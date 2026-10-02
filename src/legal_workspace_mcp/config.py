@@ -41,6 +41,11 @@ DEFAULT_EXCLUDED_PATTERNS: list[str] = [
 # Index persistence filename
 INDEX_FILENAME: str = ".legal_workspace_index.db"
 
+# Environment variable that overrides the index database location (full file path).
+# Use it to keep the index off a removable disk: SQLite memory-maps the WAL
+# "-shm" file, and a detached disk turns the next read into SIGBUS.
+INDEX_PATH_ENV_VAR: str = "LEGAL_WORKSPACE_INDEX_PATH"
+
 # Legacy index filename (for migration)
 LEGACY_INDEX_FILENAME: str = ".legal_workspace_index.json"
 
@@ -65,6 +70,7 @@ class WorkspaceConfig:
     file_extensions: set[str] = field(default_factory=lambda: SUPPORTED_EXTENSIONS.copy())
     max_file_size: int = DEFAULT_MAX_FILE_SIZE
     max_chunks_per_file: int = DEFAULT_MAX_CHUNKS_PER_FILE
+    index_path_override: Optional[str] = None
 
     @property
     def resolved_path(self) -> Path:
@@ -73,7 +79,12 @@ class WorkspaceConfig:
 
     @property
     def index_path(self) -> Path:
-        """Path to the persisted index file."""
+        """Path to the persisted index file.
+
+        Defaults to INDEX_FILENAME inside the workspace; index_path_override wins.
+        """
+        if self.index_path_override:
+            return Path(self.index_path_override).expanduser().resolve()
         return self.resolved_path / INDEX_FILENAME
 
     def to_dict(self) -> dict:
@@ -154,4 +165,5 @@ def load_config(workspace_path: Optional[str] = None) -> WorkspaceConfig:
         excluded_patterns=extra.get("excluded_patterns", DEFAULT_EXCLUDED_PATTERNS),
         max_file_size=extra.get("max_file_size", DEFAULT_MAX_FILE_SIZE),
         max_chunks_per_file=extra.get("max_chunks_per_file", DEFAULT_MAX_CHUNKS_PER_FILE),
+        index_path_override=os.environ.get(INDEX_PATH_ENV_VAR) or None,
     )

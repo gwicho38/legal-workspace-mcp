@@ -125,6 +125,16 @@ claude mcp add legal-workspace -- legal-workspace-mcp /new/path
 
 The old index is persisted inside the watched directory (`.legal_workspace_index.json`). When you point at a new directory, a fresh index is built automatically.
 
+### Index location
+
+By default the index is a SQLite database inside the watched directory (`.legal_workspace_index.db`). Set `LEGAL_WORKSPACE_INDEX_PATH` to a full file path to keep it elsewhere:
+
+```bash
+LEGAL_WORKSPACE_INDEX_PATH=~/.local/share/legal-workspace/index.db
+```
+
+Do this when the watched directory is on a removable or external disk. SQLite memory-maps the index's `-shm` file. If the disk detaches, the next read crashes the server with `SIGBUS`. With the index on the internal disk, a detached workspace only causes file read errors.
+
 ### Live updates
 
 The server uses [watchdog](https://github.com/gorakhargosh/watchdog) to monitor the directory. Changes are processed automatically:

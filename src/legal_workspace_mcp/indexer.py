@@ -66,6 +66,7 @@ class DocumentIndex:
     def _init_db(self) -> None:
         """Initialize the SQLite database and create tables."""
         db_path = self.config.index_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
 

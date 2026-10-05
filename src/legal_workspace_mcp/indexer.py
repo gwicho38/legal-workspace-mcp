@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .config import WorkspaceConfig, LEGACY_INDEX_FILENAME
+from .config import BUSY_TIMEOUT_SECONDS, WorkspaceConfig, LEGACY_INDEX_FILENAME
 from .extractors import extract_text
 
 logger = logging.getLogger(__name__)
@@ -67,12 +67,26 @@ class DocumentIndex:
         """Initialize the SQLite database and create tables."""
         db_path = self.config.index_path
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(db_path), check_same_thread=False, timeout=BUSY_TIMEOUT_SECONDS
+        )
         self._conn.row_factory = sqlite3.Row
 
+        # Every Claude session runs its own server on this one file. WAL mode
+        # memory-maps a shared "-shm" file, and a process that re-initializes
+        # it kills the others with SIGBUS (issue #7). A rollback journal has
+        # no shared mapping; the busy timeout makes readers wait out writers.
+        mode = self._conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        if mode.lower() != "delete":
+            logger.warning(
+                "Index %s stays in %s mode: another process still holds it open. "
+                "It converts on the next start after those processes exit.",
+                db_path, mode,
+            )
+
         # Performance pragmas
-        self._conn.executescript("""
-            PRAGMA journal_mode=WAL;
+        self._conn.executescript(f"""
+            PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)};
             PRAGMA synchronous=NORMAL;
             PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;

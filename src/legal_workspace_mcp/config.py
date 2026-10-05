@@ -46,6 +46,10 @@ INDEX_FILENAME: str = ".legal_workspace_index.db"
 # "-shm" file, and a detached disk turns the next read into SIGBUS.
 INDEX_PATH_ENV_VAR: str = "LEGAL_WORKSPACE_INDEX_PATH"
 
+# Seconds a process waits for another process's lock on the index database
+# before an operation fails. Several servers share one index file (issue #7).
+BUSY_TIMEOUT_SECONDS: float = 30.0
+
 # Legacy index filename (for migration)
 LEGACY_INDEX_FILENAME: str = ".legal_workspace_index.json"
 

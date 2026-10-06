@@ -14,6 +14,8 @@ Tools:
 import json
 import logging
 import sys
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -38,6 +40,33 @@ _index: Optional[DocumentIndex] = None
 _watcher: Optional[WorkspaceWatcher] = None
 _config: Optional[WorkspaceConfig] = None
 
+# State of the startup index build, which runs in a background thread.
+# "indexing" while it runs, then "ready" (with its summary) or "failed".
+_build_state: dict = {"status": "not_started"}
+
+
+def _run_startup_build(config: WorkspaceConfig) -> None:
+    """Build the index on its own connection so the server answers at once.
+
+    Claude Code gives a stdio server 30 seconds to answer ``initialize``. A
+    large workspace can take far longer to scan, so the scan must not block
+    the handshake. Searches meanwhile use what the persistent index holds.
+    """
+    started = time.time()
+    builder = None
+    try:
+        builder = DocumentIndex(config)
+        summary = builder.build_full_index()
+        _build_state.update(status="ready", summary=summary)
+        logger.info("Index ready: %s", summary)
+    except Exception as e:  # noqa: BLE001 - report, never kill the server
+        _build_state.update(status="failed", error=str(e))
+        logger.exception("Startup index build failed")
+    finally:
+        _build_state["elapsed_seconds"] = round(time.time() - started, 2)
+        if builder:
+            builder.close()
+
 
 @asynccontextmanager
 async def server_lifespan(mcp_server):
@@ -55,10 +84,14 @@ async def server_lifespan(mcp_server):
     # Create index (opens or creates SQLite database)
     _index = DocumentIndex(_config)
 
-    # Build index synchronously — SQLite is fast enough and the DB
-    # persists across restarts, so only changed files are re-indexed
-    summary = _index.build_full_index()
-    logger.info("Index ready: %s", summary)
+    # Build the index in the background: the handshake must not wait on it.
+    # The DB persists across restarts, so search works from the first call.
+    _build_state.clear()
+    _build_state["status"] = "indexing"
+    threading.Thread(
+        target=_run_startup_build, args=(_config,),
+        name="startup-index-build", daemon=True,
+    ).start()
 
     # Start file watcher for live updates
     _watcher = WorkspaceWatcher(_index, _config)
@@ -328,6 +361,7 @@ async def workspace_status() -> str:
     logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks", _index.document_count, _index.chunk_count)
     return json.dumps({
         "status": "healthy",
+        "startup_build": dict(_build_state),
         "index_type": "SQLite FTS5 (BM25)",
         "workspace_path": str(_config.resolved_path) if _config else "unknown",
         "document_count": _index.document_count,

@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 # SQLite schema version for future migrations
 SCHEMA_VERSION = 1
 
+# macOS st_flags bit for a cloud-only file whose content is not on disk
+# (OneDrive, iCloud and other File Provider folders). Reading such a file makes
+# the system download it first, which can take minutes.
+SF_DATALESS = 0x40000000
+
+
+def is_dataless(st) -> bool:
+    """True if a stat result describes a cloud-only file with no local content."""
+    return bool(getattr(st, "st_flags", 0) & SF_DATALESS)
+
 
 @dataclass
 class DocumentChunk:
@@ -212,6 +222,7 @@ class DocumentIndex:
         # Track which files are still present
         current_files: set[str] = set()
         errors: list[str] = []
+        skipped_cloud_only = 0
 
         for file_path in files:
             str_path = str(file_path)
@@ -219,6 +230,12 @@ class DocumentIndex:
 
             try:
                 stat = file_path.stat()
+
+                # Never read a cloud-only file: the read forces a download.
+                # Its existing index rows (if any) stay, since it still exists.
+                if is_dataless(stat):
+                    skipped_cloud_only += 1
+                    continue
 
                 # Skip files exceeding size limit
                 if stat.st_size > self.config.max_file_size:
@@ -258,12 +275,14 @@ class DocumentIndex:
             "documents": self.document_count,
             "chunks": self.chunk_count,
             "elapsed_seconds": round(elapsed, 2),
+            "skipped_cloud_only": skipped_cloud_only,
             "errors": errors,
         }
 
         logger.info(
-            "Index built: %d documents, %d chunks in %.2fs",
-            summary["documents"], summary["chunks"], elapsed,
+            "Index built: %d documents, %d chunks in %.2fs "
+            "(%d cloud-only files skipped, not downloaded)",
+            summary["documents"], summary["chunks"], elapsed, skipped_cloud_only,
         )
         return summary
 
@@ -282,6 +301,11 @@ class DocumentIndex:
             stat = file_path.stat()
         except FileNotFoundError:
             self._remove_file_from_db(str_path)
+            return
+
+        # Never read a cloud-only file: the read forces a download.
+        if is_dataless(stat):
+            logger.debug("Skipping %s (cloud-only, not downloaded)", file_path.name)
             return
 
         # Skip files exceeding size limit

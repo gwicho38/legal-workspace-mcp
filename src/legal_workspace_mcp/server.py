@@ -153,6 +153,15 @@ class SearchInput(BaseModel):
         ge=1,
         le=20,
     )
+    path_prefix: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional folder to search in, relative to the workspace root "
+            "(or absolute). Only documents inside it are returned. "
+            "Example: 'forms' searches the firm's form library only."
+        ),
+        max_length=500,
+    )
 
 
 class GetDocumentInput(BaseModel):
@@ -195,17 +204,20 @@ async def workspace_search(params: SearchInput) -> str:
         params (SearchInput): Search parameters containing:
             - query (str): Natural language search query
             - max_results (int): Maximum results to return (default 5)
+            - path_prefix (str, optional): Folder to search in, e.g. 'forms'
 
     Returns:
         str: JSON with search results including file names, relevance scores,
              and text snippets from matching document sections.
     """
-    logger.info("🔍 TOOL CALLED: workspace_search | query=%r | max_results=%d", params.query, params.max_results)
+    logger.info("🔍 TOOL CALLED: workspace_search | query=%r | max_results=%d | path_prefix=%r",
+                params.query, params.max_results, params.path_prefix)
 
     if _index is None:
         return json.dumps({"error": "Index not initialized. Server may still be starting."})
 
-    results = _index.search(params.query, max_results=params.max_results)
+    results = _index.search(params.query, max_results=params.max_results,
+                            path_prefix=params.path_prefix)
 
     if not results:
         return json.dumps({

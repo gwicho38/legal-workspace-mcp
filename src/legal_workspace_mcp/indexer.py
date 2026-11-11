@@ -349,12 +349,28 @@ class DocumentIndex:
                 self._remove_file_from_db(str_path)
                 logger.info("Removed %s from index", file_path.name)
 
-    def search(self, query: str, max_results: Optional[int] = None) -> list[SearchResult]:
+    def _prefix_filter(self, path_prefix: Optional[str]) -> Optional[str]:
+        """Absolute folder prefix ending in "/" for a relative or absolute path.
+
+        Symlinks are not resolved: indexed paths keep the symlink names the
+        workspace walk saw.
+        """
+        if not path_prefix or not path_prefix.strip():
+            return None
+        p = Path(path_prefix.strip()).expanduser()
+        if not p.is_absolute():
+            p = self.config.resolved_path / p
+        return os.path.normpath(str(p)).rstrip("/") + "/"
+
+    def search(self, query: str, max_results: Optional[int] = None,
+               path_prefix: Optional[str] = None) -> list[SearchResult]:
         """Search the index for relevant document chunks.
 
         Args:
             query: Search query string.
             max_results: Maximum number of results to return.
+            path_prefix: Optional folder, relative to the workspace root or
+                absolute. Only documents inside it are returned.
 
         Returns:
             List of SearchResult objects sorted by relevance (BM25).
@@ -372,16 +388,20 @@ class DocumentIndex:
         try:
             # Query with diversity limit: fetch more than needed, then apply per-file cap
             fetch_limit = limit * 5  # Fetch extra for diversity filtering
+            prefix = self._prefix_filter(path_prefix)
+            # substr, not LIKE: LIKE ignores ASCII case and treats % and _ as wildcards.
+            folder_sql = "AND substr(file_path, 1, ?) = ?" if prefix else ""
+            folder_args = (len(prefix), prefix) if prefix else ()
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT file_path, file_name, chunk_index, total_chunks, text,
                        rank
                 FROM chunks
-                WHERE chunks MATCH ?
+                WHERE chunks MATCH ? {folder_sql}
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (fts_query, fetch_limit),
+                (fts_query, *folder_args, fetch_limit),
             ).fetchall()
         except sqlite3.OperationalError as e:
             logger.warning("FTS5 query failed for %r: %s", query, e)
@@ -465,32 +485,33 @@ class DocumentIndex:
 
         str_path = str(file_path)
 
-        # Remove old data for this file
-        self._remove_file_from_db(str_path)
-
-        # Insert chunks
-        for chunk in chunks:
+        # One transaction: commit on success, roll back on any error. An
+        # error left inside an open transaction keeps the write lock for the
+        # life of the process, and every server sharing the index waits on it.
+        with self._conn:
+            self._delete_file_rows(str_path)
+            for chunk in chunks:
+                self._conn.execute(
+                    "INSERT INTO chunks(file_path, file_name, chunk_index, total_chunks, text) VALUES(?, ?, ?, ?, ?)",
+                    (str_path, file_path.name, chunk.chunk_index, chunk.total_chunks, chunk.text),
+                )
             self._conn.execute(
-                "INSERT INTO chunks(file_path, file_name, chunk_index, total_chunks, text) VALUES(?, ?, ?, ?, ?)",
-                (str_path, file_path.name, chunk.chunk_index, chunk.total_chunks, chunk.text),
+                """INSERT OR REPLACE INTO file_meta(file_path, file_name, file_hash, file_modified, file_size, total_chunks, indexed_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (str_path, file_path.name, file_hash, stat.st_mtime, stat.st_size, len(chunks), time.time()),
             )
 
-        # Insert file metadata
-        self._conn.execute(
-            """INSERT OR REPLACE INTO file_meta(file_path, file_name, file_hash, file_modified, file_size, total_chunks, indexed_at)
-               VALUES(?, ?, ?, ?, ?, ?, ?)""",
-            (str_path, file_path.name, file_hash, stat.st_mtime, stat.st_size, len(chunks), time.time()),
-        )
-        self._conn.commit()
+    def _delete_file_rows(self, file_path: str) -> None:
+        # FTS5 requires DELETE with rowid; use content match instead
+        self._conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
+        self._conn.execute("DELETE FROM file_meta WHERE file_path = ?", (file_path,))
 
     def _remove_file_from_db(self, file_path: str) -> None:
         """Remove all data for a file from the database."""
         if not self._conn:
             return
-        # FTS5 requires DELETE with rowid; use content match instead
-        self._conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
-        self._conn.execute("DELETE FROM file_meta WHERE file_path = ?", (file_path,))
-        self._conn.commit()
+        with self._conn:
+            self._delete_file_rows(file_path)
 
     def _migrate_legacy_index(self) -> None:
         """Handle migration from old JSON index format."""

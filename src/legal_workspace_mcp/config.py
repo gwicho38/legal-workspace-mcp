@@ -50,6 +50,25 @@ INDEX_PATH_ENV_VAR: str = "LEGAL_WORKSPACE_INDEX_PATH"
 # before an operation fails. Several servers share one index file (issue #7).
 BUSY_TIMEOUT_SECONDS: float = 30.0
 
+# Seconds a read-only searcher waits for a lock before a tool call answers
+# "index busy, retry shortly". A tool call holds up the server while it waits.
+READ_BUSY_TIMEOUT_SECONDS: float = 10.0
+
+# What a tool call answers while the index is locked or not yet open.
+INDEX_BUSY_MESSAGE: str = "Index busy, retry shortly."
+
+# Only one server per index runs the index build and the file watcher. It holds
+# an exclusive flock on the index path plus this suffix (issue #12).
+INDEXER_LOCK_SUFFIX: str = ".indexer.lock"
+
+# Seconds between background attempts to open the index and to take the
+# indexer lock (a reader takes over when the indexer exits).
+COORDINATOR_POLL_SECONDS: float = 2.0
+
+# Bounded retry when creating or migrating the schema meets a lock.
+SCHEMA_INIT_ATTEMPTS: int = 5
+SCHEMA_INIT_BACKOFF_SECONDS: float = 0.5
+
 # Legacy index filename (for migration)
 LEGACY_INDEX_FILENAME: str = ".legal_workspace_index.json"
 

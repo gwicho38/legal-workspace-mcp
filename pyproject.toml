@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "legal-workspace-mcp"
-version = "0.2.3"
+version = "0.2.4"
 description = "An MCP server that provides self-updating context from a local document workspace to Claude, optimized for legal drafting workflows."
 readme = "README.md"
 license = "MIT"
@@ -48,3 +48,8 @@ packages = ["src/legal_workspace_mcp"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

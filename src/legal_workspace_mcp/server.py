@@ -11,8 +11,10 @@ Tools:
     - workspace_reindex: Force a full re-index of the workspace
 """
 
+import functools
 import json
 import logging
+import sqlite3
 import sys
 import threading
 import time
@@ -23,8 +25,14 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict
 
-from .config import WorkspaceConfig, load_config
-from .indexer import DocumentIndex
+from .config import (
+    COORDINATOR_POLL_SECONDS,
+    INDEX_BUSY_MESSAGE,
+    WorkspaceConfig,
+    load_config,
+)
+from .indexer import DocumentIndex, IndexBusyError, IndexNotReady
+from .indexer_lock import IndexerLock
 from .watcher import WorkspaceWatcher
 
 # Configure logging to stderr (required for stdio transport)
@@ -35,10 +43,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Module-level state (initialized in lifespan)
-_index: Optional[DocumentIndex] = None
+# Module-level state, filled in by the background coordinator thread.
+_index: Optional[DocumentIndex] = None    # read-only connection for searches
+_writer: Optional[DocumentIndex] = None   # indexer only: watcher and reindex writes
 _watcher: Optional[WorkspaceWatcher] = None
 _config: Optional[WorkspaceConfig] = None
+_lock: Optional[IndexerLock] = None
+_stop: Optional[threading.Event] = None
+# "starting" until the first lock attempt, then "indexer" or "reader".
+_role: str = "starting"
 
 # State of the startup index build, which runs in a background thread.
 # "indexing" while it runs, then "ready" (with its summary) or "failed".
@@ -68,42 +81,101 @@ def _run_startup_build(config: WorkspaceConfig) -> None:
             builder.close()
 
 
+def _start_indexing(config: WorkspaceConfig) -> None:
+    """Indexer only: start the file watcher and the background build."""
+    global _watcher
+    _watcher = WorkspaceWatcher(_writer, config)
+    _watcher.start()
+    _build_state.clear()
+    _build_state["status"] = "indexing"
+    threading.Thread(
+        target=_run_startup_build, args=(config,),
+        name="startup-index-build", daemon=True,
+    ).start()
+
+
+def _coordinate(config: WorkspaceConfig, lock: IndexerLock, stop: threading.Event) -> None:
+    """Open the index and claim the indexer role, retrying until both are done.
+
+    Nothing here runs before the handshake, and no error here ends the
+    server: a busy or missing database is retried on the next poll (issue #12).
+    The server holding the indexer lock is the only one that writes. Readers
+    keep trying the lock, so one takes over when the indexer exits.
+    """
+    global _index, _writer, _role
+    while True:
+        try:
+            if not lock.held and lock.try_acquire():
+                logger.info("Took the indexer role")
+            _role = "indexer" if lock.held else "reader"
+            if lock.held and _writer is None:
+                _writer = DocumentIndex(config)  # creates the schema if needed
+                _start_indexing(config)
+            if _index is None:
+                _index = DocumentIndex(config, read_only=True)
+                logger.info("Index open for searches (%s)", _role)
+        except (IndexNotReady, sqlite3.Error, OSError) as e:
+            logger.info("Index not available yet (%s); retrying in %.0fs",
+                        e, COORDINATOR_POLL_SECONDS)
+        except Exception:  # noqa: BLE001 - keep retrying, never kill the server
+            logger.exception("Index coordinator error; retrying")
+        if stop.wait(COORDINATOR_POLL_SECONDS):
+            return
+
+
+def _busy_response(detail: Optional[str] = None) -> str:
+    error = INDEX_BUSY_MESSAGE + (f" ({detail})" if detail else "")
+    return json.dumps({"status": "index_busy", "error": error, "role": _role})
+
+
+def _busy_guard(tool):
+    """Answer "index busy, retry shortly" instead of failing on a locked or unopened index."""
+    @functools.wraps(tool)
+    async def guarded(*args, **kwargs):
+        if _index is None:
+            return _busy_response()
+        try:
+            return await tool(*args, **kwargs)
+        except (IndexBusyError, sqlite3.OperationalError) as e:
+            logger.warning("Tool %s: index busy: %s", tool.__name__, e)
+            return _busy_response(str(e))
+    return guarded
+
+
 @asynccontextmanager
 async def server_lifespan(mcp_server):
-    """Initialize index and file watcher on server startup."""
-    global _index, _watcher, _config
+    """Start the background coordinator; open no database before the handshake."""
+    global _index, _writer, _watcher, _config, _lock, _stop, _role
 
     # Load config - workspace path comes from CLI arg or env var
     workspace_path = None
     if len(sys.argv) > 1:
         workspace_path = sys.argv[1]
     _config = load_config(workspace_path)
-
     logger.info("Workspace: %s", _config.resolved_path)
 
-    # Create index (opens or creates SQLite database)
-    _index = DocumentIndex(_config)
-
-    # Build the index in the background: the handshake must not wait on it.
-    # The DB persists across restarts, so search works from the first call.
+    _index = _writer = _watcher = None
+    _role = "starting"
     _build_state.clear()
-    _build_state["status"] = "indexing"
-    threading.Thread(
-        target=_run_startup_build, args=(_config,),
-        name="startup-index-build", daemon=True,
-    ).start()
+    _build_state["status"] = "not_started"
+    _lock = IndexerLock(_config.index_path)
+    _stop = threading.Event()
+    coordinator = threading.Thread(
+        target=_coordinate, args=(_config, _lock, _stop),
+        name="index-coordinator", daemon=True,
+    )
+    coordinator.start()
 
-    # Start file watcher for live updates
-    _watcher = WorkspaceWatcher(_index, _config)
-    _watcher.start()
+    yield {"config": _config}
 
-    yield {"index": _index, "watcher": _watcher, "config": _config}
-
-    # Cleanup
+    _stop.set()
+    coordinator.join(timeout=COORDINATOR_POLL_SECONDS * 2)
     if _watcher:
         _watcher.stop()
-    if _index:
-        _index.close()
+    for conn in (_writer, _index):
+        if conn:
+            conn.close()
+    _lock.release()
 
 
 # Initialize FastMCP server
@@ -193,6 +265,7 @@ class GetDocumentInput(BaseModel):
         "openWorldHint": False,
     },
 )
+@_busy_guard
 async def workspace_search(params: SearchInput) -> str:
     """Search across all documents in the legal workspace for relevant content.
 
@@ -212,9 +285,6 @@ async def workspace_search(params: SearchInput) -> str:
     """
     logger.info("🔍 TOOL CALLED: workspace_search | query=%r | max_results=%d | path_prefix=%r",
                 params.query, params.max_results, params.path_prefix)
-
-    if _index is None:
-        return json.dumps({"error": "Index not initialized. Server may still be starting."})
 
     results = _index.search(params.query, max_results=params.max_results,
                             path_prefix=params.path_prefix)
@@ -262,6 +332,7 @@ async def workspace_search(params: SearchInput) -> str:
         "openWorldHint": False,
     },
 )
+@_busy_guard
 async def workspace_get_document(params: GetDocumentInput) -> str:
     """Retrieve the full text content of a specific document from the workspace.
 
@@ -277,9 +348,6 @@ async def workspace_get_document(params: GetDocumentInput) -> str:
         str: The full document text content, or an error message if not found.
     """
     logger.info("📄 TOOL CALLED: workspace_get_document | file_path=%r", params.file_path)
-
-    if _index is None:
-        return json.dumps({"error": "Index not initialized."})
 
     text = _index.get_document_text(params.file_path)
 
@@ -322,6 +390,7 @@ async def workspace_get_document(params: GetDocumentInput) -> str:
         "openWorldHint": False,
     },
 )
+@_busy_guard
 async def workspace_list_documents() -> str:
     """List all documents currently indexed in the legal workspace.
 
@@ -332,9 +401,6 @@ async def workspace_list_documents() -> str:
         str: JSON with list of indexed document paths and count.
     """
     logger.info("📋 TOOL CALLED: workspace_list_documents")
-
-    if _index is None:
-        return json.dumps({"error": "Index not initialized."})
 
     files = _index.indexed_files
     logger.info("📋 TOOL RESULT: workspace_list_documents | %d documents", len(files))
@@ -368,20 +434,26 @@ async def workspace_status() -> str:
     logger.info("📊 TOOL CALLED: workspace_status")
 
     if _index is None:
-        return json.dumps({"status": "initializing", "message": "Index not yet ready."})
+        return json.dumps({"status": "index_busy", "message": INDEX_BUSY_MESSAGE,
+                           "role": _role, "startup_build": dict(_build_state)})
 
-    logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks", _index.document_count, _index.chunk_count)
-    return json.dumps({
-        "status": "healthy",
-        "startup_build": dict(_build_state),
-        "index_type": "SQLite FTS5 (BM25)",
-        "workspace_path": str(_config.resolved_path) if _config else "unknown",
-        "document_count": _index.document_count,
-        "chunk_count": _index.chunk_count,
-        "database_size_mb": round(_index.database_size_mb, 2),
-        "watcher_active": _watcher.is_running if _watcher else False,
-        "indexed_files": _index.indexed_files,
-    }, indent=2)
+    try:
+        logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks",
+                    _index.document_count, _index.chunk_count)
+        return json.dumps({
+            "status": "healthy",
+            "role": _role,
+            "startup_build": dict(_build_state),
+            "index_type": "SQLite FTS5 (BM25)",
+            "workspace_path": str(_config.resolved_path) if _config else "unknown",
+            "document_count": _index.document_count,
+            "chunk_count": _index.chunk_count,
+            "database_size_mb": round(_index.database_size_mb, 2),
+            "watcher_active": _watcher.is_running if _watcher else False,
+            "indexed_files": _index.indexed_files,
+        }, indent=2)
+    except sqlite3.OperationalError as e:
+        return _busy_response(str(e))
 
 
 @mcp.tool(
@@ -394,6 +466,7 @@ async def workspace_status() -> str:
         "openWorldHint": False,
     },
 )
+@_busy_guard
 async def workspace_reindex() -> str:
     """Force a complete re-index of all documents in the workspace.
 
@@ -406,10 +479,15 @@ async def workspace_reindex() -> str:
     """
     logger.info("🔄 TOOL CALLED: workspace_reindex")
 
-    if _index is None:
-        return json.dumps({"error": "Index not initialized."})
+    if _writer is None:
+        return json.dumps({
+            "status": "not_indexer",
+            "role": _role,
+            "message": "Another server process is the indexer for this index and keeps "
+                       "it up to date. Its file watcher picks up changes.",
+        })
 
-    summary = _index.build_full_index()
+    summary = _writer.build_full_index()
     logger.info("🔄 TOOL RESULT: workspace_reindex | %s", summary)
     return json.dumps({
         "status": "reindex_complete",

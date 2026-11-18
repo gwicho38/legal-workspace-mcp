@@ -51,6 +51,11 @@ claude mcp add legal-workspace -- legal-workspace-mcp /path/to/your/documents
 
 That's it. The server starts automatically with every `claude` session.
 
+Each session starts its own server, and all of them share one index. One of them, the
+indexer, holds `<index>.indexer.lock` and is the only one that builds the index and runs
+the file watcher. The others only read. When the indexer exits, another server takes over.
+While the index is locked or still opening, a tool call answers "Index busy, retry shortly."
+
 **To change the target directory**, remove and re-add:
 
 ```bash
@@ -179,8 +184,8 @@ Once configured, Claude gains access to these tools:
 | `workspace_search` | Search all documents for relevant content by topic or keyword. `path_prefix` keeps results inside one folder (e.g. `forms`). |
 | `workspace_get_document` | Retrieve the full text of a specific document |
 | `workspace_list_documents` | List all indexed documents in the workspace |
-| `workspace_status` | Check index health, document count, and watcher status |
-| `workspace_reindex` | Force a complete re-index (rarely needed) |
+| `workspace_status` | Check index health, document count, watcher status, and this server's role (`indexer` or `reader`) |
+| `workspace_reindex` | Force a complete re-index (rarely needed; indexer only) |
 
 ## Supported File Types
 

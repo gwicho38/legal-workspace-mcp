@@ -13,8 +13,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
-from .config import BUSY_TIMEOUT_SECONDS, WorkspaceConfig, LEGACY_INDEX_FILENAME
+from .config import (
+    BUSY_TIMEOUT_SECONDS,
+    LEGACY_INDEX_FILENAME,
+    READ_BUSY_TIMEOUT_SECONDS,
+    SCHEMA_INIT_ATTEMPTS,
+    SCHEMA_INIT_BACKOFF_SECONDS,
+    WorkspaceConfig,
+)
 from .extractors import extract_text
 
 logger = logging.getLogger(__name__)
@@ -57,6 +65,42 @@ class SearchResult:
     snippet: str
 
 
+class IndexNotReady(Exception):
+    """A reader found no index file or no current schema yet."""
+
+
+class IndexBusyError(Exception):
+    """Another process holds a lock on the index; retry shortly."""
+
+
+def is_busy_error(error: sqlite3.Error) -> bool:
+    """True if a SQLite error means another connection holds a lock.
+
+    FTS5 reports a lock met while it opens its table as "vtable constructor
+    failed", not as "database is locked".
+    """
+    code = getattr(error, "sqlite_errorcode", None)
+    if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return True
+    message = str(error).lower()
+    return any(word in message for word in ("locked", "busy", "vtable constructor failed"))
+
+
+def _retry_on_busy(operation):
+    """Run ``operation``; on a lock error retry with doubling backoff, a bounded number of times."""
+    delay = SCHEMA_INIT_BACKOFF_SECONDS
+    for attempt in range(1, SCHEMA_INIT_ATTEMPTS + 1):
+        try:
+            return operation()
+        except sqlite3.OperationalError as e:
+            if not is_busy_error(e) or attempt == SCHEMA_INIT_ATTEMPTS:
+                raise
+            logger.info("Index busy (%s); retry %d of %d in %.1fs",
+                        e, attempt, SCHEMA_INIT_ATTEMPTS - 1, delay)
+            time.sleep(delay)
+            delay *= 2
+
+
 class DocumentIndex:
     """SQLite FTS5 document index with BM25 ranking.
 
@@ -68,82 +112,132 @@ class DocumentIndex:
     - File size and chunk limits to bound memory usage
     """
 
-    def __init__(self, config: WorkspaceConfig):
+    def __init__(self, config: WorkspaceConfig, read_only: bool = False):
+        """Open the index.
+
+        A writer creates or migrates the schema when needed. A reader
+        (``read_only=True``) opens the file read-only and raises
+        ``IndexNotReady`` if the schema is not there yet.
+        """
         self.config = config
+        self.read_only = read_only
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db()
+        try:
+            self._init_db()
+        except BaseException:
+            self.close()
+            raise
 
     def _init_db(self) -> None:
-        """Initialize the SQLite database and create tables."""
+        """Open the database. Write only when the schema must be created or migrated.
+
+        Every Claude session runs its own server on one index file. A write here
+        on every start made each new server wait on the others' write locks
+        until the busy timeout expired, and the server died (issue #12).
+        """
         db_path = self.config.index_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(
-            str(db_path), check_same_thread=False, timeout=BUSY_TIMEOUT_SECONDS
-        )
+        if self.read_only:
+            if not db_path.exists():
+                raise IndexNotReady(f"Index {db_path} does not exist yet")
+            uri = f"file:{quote(str(db_path))}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                                         timeout=READ_BUSY_TIMEOUT_SECONDS)
+            busy_seconds = READ_BUSY_TIMEOUT_SECONDS
+        else:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(db_path), check_same_thread=False,
+                                         timeout=BUSY_TIMEOUT_SECONDS)
+            busy_seconds = BUSY_TIMEOUT_SECONDS
         self._conn.row_factory = sqlite3.Row
 
-        # Every Claude session runs its own server on this one file. WAL mode
-        # memory-maps a shared "-shm" file, and a process that re-initializes
-        # it kills the others with SIGBUS (issue #7). A rollback journal has
-        # no shared mapping; the busy timeout makes readers wait out writers.
-        mode = self._conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
-        if mode.lower() != "delete":
-            logger.warning(
-                "Index %s stays in %s mode: another process still holds it open. "
-                "It converts on the next start after those processes exit.",
-                db_path, mode,
-            )
-
-        # Performance pragmas
+        # Connection-local settings; none of them writes to the file.
         self._conn.executescript(f"""
-            PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)};
+            PRAGMA busy_timeout={int(busy_seconds * 1000)};
             PRAGMA synchronous=NORMAL;
             PRAGMA cache_size=-2000;
             PRAGMA temp_store=MEMORY;
         """)
 
-        # Create tables
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS file_meta(
-                file_path TEXT PRIMARY KEY,
-                file_name TEXT NOT NULL,
-                file_hash TEXT NOT NULL,
-                file_modified REAL NOT NULL,
-                file_size INTEGER NOT NULL,
-                total_chunks INTEGER NOT NULL,
-                indexed_at REAL NOT NULL
-            );
+        if self.read_only:
+            if not self._schema_is_current():
+                raise IndexNotReady(f"Index {db_path} has no current schema yet")
+            return
 
-            CREATE TABLE IF NOT EXISTS schema_info(
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-        """)
+        if self._schema_is_current() and self._journal_mode() == "delete":
+            return
+        _retry_on_busy(self._create_schema)
 
-        # Create FTS5 table if it doesn't exist
-        self._conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
-                file_path UNINDEXED,
-                file_name,
-                chunk_index UNINDEXED,
-                total_chunks UNINDEXED,
-                text,
-                tokenize='porter unicode61'
-            );
-        """)
+    def _journal_mode(self) -> str:
+        return self._conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
 
-        # Store schema version
-        self._conn.execute(
-            "INSERT OR REPLACE INTO schema_info(key, value) VALUES('version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-        self._conn.commit()
+    def _schema_is_current(self) -> bool:
+        """Read-only check that every table exists at SCHEMA_VERSION."""
+        names = {row[0] for row in self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE name IN ('file_meta', 'schema_info', 'chunks')"
+        )}
+        if names != {"file_meta", "schema_info", "chunks"}:
+            return False
+        row = self._conn.execute(
+            "SELECT value FROM schema_info WHERE key = 'version'").fetchone()
+        return bool(row) and row[0] == str(SCHEMA_VERSION)
+
+    def _create_schema(self) -> None:
+        """Create or migrate the schema in one write transaction."""
+        conn = self._conn
+        # A WAL file memory-maps a shared "-shm" file, and a process that
+        # re-initializes it kills the others with SIGBUS (issue #7). A rollback
+        # journal has no shared mapping.
+        if self._journal_mode() != "delete":
+            mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            if mode.lower() != "delete":
+                logger.warning(
+                    "Index %s stays in %s mode: another process still holds it open. "
+                    "It converts on the next start after those processes exit.",
+                    self.config.index_path, mode,
+                )
+        if self._schema_is_current():
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS file_meta(
+                    file_path TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    file_hash TEXT NOT NULL,
+                    file_modified REAL NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    total_chunks INTEGER NOT NULL,
+                    indexed_at REAL NOT NULL
+                )""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_info(
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )""")
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+                    file_path UNINDEXED,
+                    file_name,
+                    chunk_index UNINDEXED,
+                    total_chunks UNINDEXED,
+                    text,
+                    tokenize='porter unicode61'
+                )""")
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_info(key, value) VALUES('version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def close(self) -> None:
         """Close the database connection."""
         if self._conn:
             try:
-                self._conn.execute("PRAGMA optimize")
+                if not self.read_only:
+                    self._conn.execute("PRAGMA optimize")
                 self._conn.close()
             except Exception as e:
                 logger.error("Error closing database: %s", e)
@@ -404,6 +498,8 @@ class DocumentIndex:
                 (fts_query, *folder_args, fetch_limit),
             ).fetchall()
         except sqlite3.OperationalError as e:
+            if is_busy_error(e):
+                raise IndexBusyError(str(e)) from e
             logger.warning("FTS5 query failed for %r: %s", query, e)
             return []
 

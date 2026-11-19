@@ -236,6 +236,21 @@ class SearchInput(BaseModel):
     )
 
 
+LIST_PAGE_SIZE = 500  # paths per workspace_list_documents page (issue #14)
+
+
+class ListDocumentsInput(BaseModel):
+    """Input for listing indexed documents, one page at a time."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    offset: int = Field(default=0, ge=0, description="Index of the first path to return. Use next_offset from the previous page.")
+    path_prefix: Optional[str] = Field(
+        default=None,
+        description="Only list documents in this folder (relative to the workspace root, e.g. 'forms').",
+    )
+
+
 class GetDocumentInput(BaseModel):
     """Input for retrieving a specific document."""
 
@@ -391,21 +406,28 @@ async def workspace_get_document(params: GetDocumentInput) -> str:
     },
 )
 @_busy_guard
-async def workspace_list_documents() -> str:
-    """List all documents currently indexed in the legal workspace.
+async def workspace_list_documents(params: Optional[ListDocumentsInput] = None) -> str:
+    """List documents indexed in the legal workspace, one page at a time.
 
-    Use this tool to see what documents are available for searching and
-    reference. Returns file paths relative to the workspace root.
+    Returns up to 500 paths relative to the workspace root, the total count
+    and next_offset (null on the last page). Pass path_prefix to list one
+    folder, e.g. 'forms'.
 
     Returns:
-        str: JSON with list of indexed document paths and count.
+        str: JSON with document_count, documents, offset and next_offset.
     """
-    logger.info("📋 TOOL CALLED: workspace_list_documents")
+    params = params or ListDocumentsInput()
+    logger.info("📋 TOOL CALLED: workspace_list_documents | offset=%d prefix=%s",
+                params.offset, params.path_prefix)
 
-    files = _index.indexed_files
-    logger.info("📋 TOOL RESULT: workspace_list_documents | %d documents", len(files))
+    total, files = _index.list_files(offset=params.offset, limit=LIST_PAGE_SIZE,
+                                     path_prefix=params.path_prefix)
+    end = params.offset + len(files)
+    logger.info("📋 TOOL RESULT: workspace_list_documents | %d of %d documents", len(files), total)
     return json.dumps({
-        "document_count": len(files),
+        "document_count": total,
+        "offset": params.offset,
+        "next_offset": end if end < total else None,
         "documents": files,
         "workspace_path": str(_config.resolved_path) if _config else "unknown",
     }, indent=2)
@@ -438,19 +460,18 @@ async def workspace_status() -> str:
                            "role": _role, "startup_build": dict(_build_state)})
 
     try:
-        logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks",
-                    _index.document_count, _index.chunk_count)
+        docs, chunks = _index.document_count, _index.chunk_count
+        logger.info("📊 TOOL RESULT: workspace_status | %d docs, %d chunks", docs, chunks)
         return json.dumps({
             "status": "healthy",
             "role": _role,
             "startup_build": dict(_build_state),
             "index_type": "SQLite FTS5 (BM25)",
             "workspace_path": str(_config.resolved_path) if _config else "unknown",
-            "document_count": _index.document_count,
-            "chunk_count": _index.chunk_count,
+            "document_count": docs,
+            "chunk_count": chunks,
             "database_size_mb": round(_index.database_size_mb, 2),
             "watcher_active": _watcher.is_running if _watcher else False,
-            "indexed_files": _index.indexed_files,
         }, indent=2)
     except sqlite3.OperationalError as e:
         return _busy_response(str(e))

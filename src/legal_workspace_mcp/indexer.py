@@ -254,11 +254,16 @@ class DocumentIndex:
 
     @property
     def chunk_count(self) -> int:
-        """Total number of chunks in the index."""
+        """Total number of chunks in the index.
+
+        Sums file_meta.total_chunks. COUNT(*) on the FTS5 chunks table scans
+        every row (41 s on a 940k-chunk index, issue #14).
+        """
         if not self._conn:
             return 0
-        row = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
-        return row[0] if row else 0
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(total_chunks), 0) FROM file_meta").fetchone()
+        return int(row[0]) if row else 0
 
     @property
     def indexed_files(self) -> list[str]:
@@ -276,6 +281,32 @@ class DocumentIndex:
             except ValueError:
                 result.append(row[0])
         return result
+
+    def list_files(self, offset: int = 0, limit: Optional[int] = None,
+                   path_prefix: Optional[str] = None) -> tuple[int, list[str]]:
+        """One page of indexed paths (relative to workspace) and the total count.
+
+        path_prefix limits the list to one folder, as in search().
+        """
+        if not self._conn:
+            return 0, []
+        prefix = self._prefix_filter(path_prefix)
+        where = "WHERE substr(file_path, 1, ?) = ?" if prefix else ""
+        args = (len(prefix), prefix) if prefix else ()
+        total = self._conn.execute(
+            f"SELECT COUNT(*) FROM file_meta {where}", args).fetchone()[0]
+        rows = self._conn.execute(
+            f"SELECT file_path FROM file_meta {where} ORDER BY file_path LIMIT ? OFFSET ?",
+            (*args, -1 if limit is None else limit, offset),
+        ).fetchall()
+        workspace = self.config.resolved_path
+        page = []
+        for row in rows:
+            try:
+                page.append(str(Path(row[0]).relative_to(workspace)))
+            except ValueError:
+                page.append(row[0])
+        return total, page
 
     @property
     def database_size_mb(self) -> float:
